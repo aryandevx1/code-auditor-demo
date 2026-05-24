@@ -22,6 +22,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+          cache: false
 
       # ── 3. Find changed .go files ─────────────────────────────────────────
       - name: Get changed Go files
