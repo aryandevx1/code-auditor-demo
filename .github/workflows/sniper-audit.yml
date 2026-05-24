@@ -1,0 +1,290 @@
+name: Sniper AI — Go Security Audit
+
+on:
+  push:
+    paths:
+      - '**.go'
+
+jobs:
+  audit:
+    name: Run Sniper AI Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # ── 2. Install Go (needed for go/ast parsing) ─────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # ── 3. Find changed .go files ─────────────────────────────────────────
+      - name: Get changed Go files
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- '*.go' | head -10)
+          if [ -z "$CHANGED" ]; then
+            echo "No Go files changed. Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            FILES_PIPE=$(echo "$CHANGED" | tr '\n' '|' | sed 's/|$//')
+            echo "files=$FILES_PIPE" >> $GITHUB_OUTPUT
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 4. Extract functions using Go AST ────────────────────────────────
+      - name: Extract functions via AST
+        id: extract
+        if: steps.changed.outputs.skip == 'false'
+        run: |
+          FILES="${{ steps.changed.outputs.files }}"
+          IFS='|' read -ra FILE_LIST <<< "$FILES"
+
+          # Write the Go AST extractor script
+          cat > /tmp/extract_functions.go << 'GOEOF'
+          package main
+
+          import (
+            "encoding/json"
+            "fmt"
+            "go/ast"
+            "go/parser"
+            "go/token"
+            "os"
+            "strings"
+          )
+
+          type Function struct {
+            Name     string `json:"name"`
+            File     string `json:"file"`
+            StartLine int   `json:"start_line"`
+            EndLine   int   `json:"end_line"`
+            Code      string `json:"code"`
+          }
+
+          func main() {
+            filepath := os.Args[1]
+
+            src, err := os.ReadFile(filepath)
+            if err != nil {
+              fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
+              os.Exit(1)
+            }
+
+            fset := token.NewFileSet()
+            node, err := parser.ParseFile(fset, filepath, src, parser.AllErrors)
+            if err != nil {
+              fmt.Fprintf(os.Stderr, "Parse error: %v\n", err)
+              os.Exit(1)
+            }
+
+            lines := strings.Split(string(src), "\n")
+            var functions []Function
+
+            ast.Inspect(node, func(n ast.Node) bool {
+              fn, ok := n.(*ast.FuncDecl)
+              if !ok {
+                return true
+              }
+
+              start := fset.Position(fn.Pos()).Line
+              end   := fset.Position(fn.End()).Line
+
+              // Extract source lines for this function (1-indexed)
+              var codeLines []string
+              if start > 0 && end <= len(lines) {
+                codeLines = lines[start-1 : end]
+              }
+
+              functions = append(functions, Function{
+                Name:      fn.Name.Name,
+                File:      filepath,
+                StartLine: start,
+                EndLine:   end,
+                Code:      strings.Join(codeLines, "\n"),
+              })
+              return true
+            })
+
+            out, _ := json.MarshalIndent(functions, "", "  ")
+            fmt.Println(string(out))
+          }
+          GOEOF
+
+          # Run extractor on each changed file, collect all functions into one JSON array
+          ALL_FUNCTIONS="[]"
+
+          for FILE in "${FILE_LIST[@]}"; do
+            if [ ! -f "$FILE" ]; then
+              echo "Skipping $FILE — not found"
+              continue
+            fi
+
+            echo "Extracting functions from: $FILE"
+            FUNCS=$(go run /tmp/extract_functions.go "$FILE" 2>/dev/null)
+
+            if [ -z "$FUNCS" ] || [ "$FUNCS" = "null" ]; then
+              echo "No functions found in $FILE"
+              continue
+            fi
+
+            # Merge into ALL_FUNCTIONS array
+            ALL_FUNCTIONS=$(python3 -c "
+          import json, sys
+          existing = json.loads('''$ALL_FUNCTIONS''')
+          new = json.loads('''$FUNCS''')
+          existing.extend(new)
+          print(json.dumps(existing))
+          ")
+          done
+
+          echo "$ALL_FUNCTIONS" > /tmp/functions.json
+          COUNT=$(python3 -c "import json; print(len(json.load(open('/tmp/functions.json'))))")
+          echo "Total functions extracted: $COUNT"
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      # ── 5. Audit each function via Sniper AI ──────────────────────────────
+      - name: Send functions to Sniper AI
+        id: audit
+        if: steps.changed.outputs.skip == 'false' && steps.extract.outputs.count != '0'
+        env:
+          SNIPER_URL: ${{ secrets.SNIPER_COLAB_URL }}
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ANY_VULN=false
+          FULL_REPORT=""
+
+          FUNCTIONS=$(cat /tmp/functions.json)
+          COUNT=$(python3 -c "import json; print(len(json.loads('''$FUNCTIONS''')))")
+
+          for i in $(seq 0 $(($COUNT - 1))); do
+            # Extract individual function data
+            FUNC_DATA=$(python3 -c "
+          import json
+          funcs = json.loads(open('/tmp/functions.json').read())
+          print(json.dumps(funcs[$i]))
+          ")
+
+            FUNC_NAME=$(python3 -c "import json,sys; d=json.loads('''$FUNC_DATA'''); print(d['name'])")
+            FUNC_FILE=$(python3 -c "import json,sys; d=json.loads('''$FUNC_DATA'''); print(d['file'])")
+            START=$(python3 -c "import json,sys; d=json.loads('''$FUNC_DATA'''); print(d['start_line'])")
+            END=$(python3 -c "import json,sys; d=json.loads('''$FUNC_DATA'''); print(d['end_line'])")
+
+            echo "Auditing: $FUNC_NAME() in $FUNC_FILE (lines $START–$END)"
+
+            # Send function to model
+            RESPONSE=$(python3 -c "
+          import json, urllib.request, sys
+
+          with open('/tmp/functions.json') as f:
+              funcs = json.load(f)
+
+          func = funcs[$i]
+          payload = json.dumps({
+              'filename': func['file'],
+              'function_name': func['name'],
+              'start_line': func['start_line'],
+              'end_line': func['end_line'],
+              'code': func['code']
+          }).encode()
+
+          import urllib.error
+          try:
+              req = urllib.request.Request(
+                  '${SNIPER_URL}/audit',
+                  data=payload,
+                  headers={'Content-Type': 'application/json'},
+                  method='POST'
+              )
+              with urllib.request.urlopen(req, timeout=120) as resp:
+                  print(resp.read().decode())
+          except Exception as e:
+              print(json.dumps({'verdict': 'UNKNOWN', 'report': str(e)}))
+          ")
+
+            VERDICT=$(python3 -c "
+          import json, sys
+          try:
+              d = json.loads('''$RESPONSE''')
+              print(d.get('verdict', 'UNKNOWN'))
+          except:
+              print('UNKNOWN')
+          ")
+
+            REPORT=$(python3 -c "
+          import json
+          try:
+              d = json.loads(open('/tmp/functions.json').read())
+              # use response directly
+              pass
+          except: pass
+
+          try:
+              resp = json.loads('''$RESPONSE''')
+              print(resp.get('report', 'No report returned.'))
+          except:
+              print('Failed to parse response.')
+          ")
+
+            if [ "$VERDICT" = "VULNERABLE" ]; then
+              BADGE="🔴 VULNERABLE"
+              ANY_VULN=true
+            elif [ "$VERDICT" = "SECURE" ]; then
+              BADGE="🟢 SECURE"
+            else
+              BADGE="⚠️ UNKNOWN"
+            fi
+
+            FULL_REPORT="${FULL_REPORT}
+          ### \`${FUNC_FILE}\` → \`${FUNC_NAME}()\` (lines ${START}–${END}) — ${BADGE}
+          \`\`\`
+          ${REPORT}
+          \`\`\`
+          ---
+          "
+          done
+
+          echo "$FULL_REPORT" > audit_report.md
+          echo "any_vuln=$ANY_VULN" >> $GITHUB_OUTPUT
+
+      # ── 6. Post report as commit comment ─────────────────────────────────
+      - name: Post audit report as commit comment
+        if: steps.changed.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMIT_SHA="${{ github.sha }}"
+          REPO="${{ github.repository }}"
+
+          COMMENT_BODY=$(python3 -c "
+          import json
+
+          header  = '## 🔍 Sniper AI V5 — Security Audit Report\n\n'
+          header += '> Automated **function-level** Go security audit triggered by commit \`$COMMIT_SHA\`\n\n'
+
+          with open('audit_report.md') as f:
+              body = f.read()
+
+          footer  = '\n\n---\n'
+          footer += '*Powered by Sniper AI V5 • Function extraction via Go AST • '
+          footer += 'Model: Llama 3 8B + LoRA fine-tuned on OSV Go vulnerability dataset*'
+
+          print(json.dumps(header + body + footer))
+          ")
+
+          curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/commits/$COMMIT_SHA/comments" \
+            -d "{\"body\": $COMMENT_BODY}"
+
+      # ── 7. Fail if vulnerable (uncomment to enforce) ──────────────────────
+      # - name: Fail on vulnerability
+      #   if: steps.audit.outputs.any_vuln == 'true'
+      #   run: exit 1
