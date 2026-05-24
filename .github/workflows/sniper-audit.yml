@@ -263,7 +263,7 @@ jobs:
           PY_FORMAT_COMMENT: |
             import json, os
             commit = os.environ.get('COMMIT_SHA')
-            header = f'## 🔍 Sniper AI V5 — Security Audit Report\n\n> Automated **function-level** Go security audit triggered by commit `{commit}`\n\n'
+            header = f'## 🔍 AI Code Auditor — Security Audit Report\n\n> Automated **function-level** Go security audit triggered by commit `{commit}`\n\n'
 
             try:
                 with open('audit_report.md') as f:
@@ -274,7 +274,7 @@ jobs:
             if not body.strip():
                 body = '_No functions were audited in this push._\n'
 
-            footer = '\n\n---\n*Powered by Sniper AI V5 • Function extraction via Go AST • Model: Llama 3 8B + LoRA fine-tuned on OSV Go vulnerability dataset*'
+            footer = '\n\n---\n*Powered by AI Code Auditor • Function extraction via Go AST • Model: Llama 3 8B + LoRA fine-tuned on OSV Go vulnerability dataset*'
 
             with open('/tmp/comment_body.json', 'w') as f:
                 json.dump(header + body + footer, f)
