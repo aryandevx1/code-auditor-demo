@@ -47,7 +47,8 @@ jobs:
           IFS='|' read -ra FILE_LIST <<< "$FILES"
 
           # Write the Go AST extractor script
-          cat > /tmp/extract_functions.go << 'GOEOF'
+          mkdir -p /tmp/astextractor
+          cat > /tmp/astextractor/main.go << 'GOEOF'
           package main
 
           import (
@@ -127,7 +128,7 @@ jobs:
             fi
 
             echo "Extracting functions from: $FILE"
-            FUNCS=$(go run /tmp/extract_functions.go "$FILE" 2>/dev/null)
+            FUNCS=$(go run /tmp/astextractor/main.go "$FILE")
 
             if [ -z "$FUNCS" ] || [ "$FUNCS" = "null" ]; then
               echo "No functions found in $FILE"
