@@ -131,7 +131,7 @@ jobs:
             fi
 
             echo "Extracting functions from: $FILE"
-            FUNCS=$(go run /tmp/astextractor/main.go "$FILE")
+            FUNCS=$(/tmp/astextractor/extractor "$FILE")
 
             if [ -z "$FUNCS" ] || [ "$FUNCS" = "null" ]; then
               echo "No functions found in $FILE"
