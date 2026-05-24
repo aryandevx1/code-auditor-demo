@@ -211,8 +211,14 @@ jobs:
             badges = {'VULNERABLE': '🔴 VULNERABLE', 'SECURE': '🟢 SECURE'}
             badge_str = badges.get(badge, '⚠️ UNKNOWN')
 
-            entry = f'### `{func_file}` → `{func_name}()` (lines {start}–{end}) — {badge_str}\n'
-            entry += f'```\n{report}\n```\n---\n\n'
+            import re
+            # Clean stray code fences inside the report
+            report = re.sub(r'```go\s*', '', report)
+            report = re.sub(r'```\s*', '', report)
+            report = report.strip()
+
+            entry = f'### `{func_file}` → `{func_name}()` (lines {start}–{end}) — {badge_str}\n\n'
+            entry += f'```\n{report}\n```\n\n---\n\n'
 
             with open('audit_report.md', 'a') as f:
                 f.write(entry)
